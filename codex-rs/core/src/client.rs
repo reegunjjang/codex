@@ -42,6 +42,9 @@ use async_channel::Sender;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::AuthProvider;
+use codex_api::ChatCompletionsClient as ApiChatCompletionsClient;
+use codex_api::ChatCompletionsRequest;
+use codex_api::ChatToolNameMapping;
 use codex_api::Compression;
 use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
@@ -68,6 +71,7 @@ use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::auth_header_telemetry;
 use codex_api::build_session_headers;
+use codex_api::chat_messages_from_response_items;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
 use codex_features::RuntimeAuthMode;
@@ -106,6 +110,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolSpec;
 use codex_tools::create_tools_json_for_responses_lite;
 use codex_tools::create_tools_raw_json_for_responses_api;
@@ -2491,6 +2496,15 @@ impl ModelClientSession {
     ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
+            WireApi::Chat => {
+                self.stream_chat_completions_http(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    inference_trace,
+                )
+                .await
+            }
             WireApi::Responses => {
                 if self.client.responses_websocket_enabled() {
                     let request_trace = current_span_w3c_trace_context();
@@ -2531,6 +2545,150 @@ impl ModelClientSession {
                         inference_trace,
                     )
                     .await
+            }
+        }
+    }
+
+    async fn stream_chat_completions_http(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let client_setup = self
+            .client
+            .current_client_setup(ClientRouting::ConfiguredProvider)
+            .await?;
+        let messages = chat_messages_from_response_items(
+            Some(prompt.base_instructions.text.as_str()),
+            &prompt.get_formatted_input_for_request(model_info),
+        )
+        .map_err(|error| self.client.state.provider.map_api_error(error))?;
+        let mut tools = Vec::new();
+        let mut tool_name_mappings = Vec::new();
+        for tool in prompt.tools.iter() {
+            let serialized =
+                serde_json::to_value(tool).map_err(|error| CodexErr::Stream(error.to_string()))?;
+            let specs = match tool {
+                ToolSpec::Function(_) => vec![(serialized.clone(), None)],
+                ToolSpec::Namespace(namespace) => namespace
+                    .tools
+                    .iter()
+                    .map(|namespace_tool| {
+                        let (value, name_space) = match namespace_tool {
+                            ResponsesApiNamespaceTool::Function(function) => {
+                                (serde_json::to_value(function), namespace.name.clone())
+                            }
+                            ResponsesApiNamespaceTool::Custom(_) => {
+                                return Err(CodexErr::Stream(format!("Chat Completions does not support custom tool `{}` in namespace `{}`", tool.name(), namespace.name)));
+                            }
+                        };
+                        value
+                            .map(|value| (value, Some(name_space)))
+                            .map_err(|error| CodexErr::Stream(error.to_string()))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                ToolSpec::Freeform(_) | ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } => {
+                    return Err(CodexErr::Stream(format!("Chat Completions cannot represent Codex tool `{}`", tool.name())));
+                }
+            };
+            for (spec, namespace) in specs {
+                let Some(name) = spec.get("name").and_then(serde_json::Value::as_str) else {
+                    return Err(CodexErr::Stream(format!(
+                        "Chat Completions cannot represent Codex tool `{}`",
+                        tool.name()
+                    )));
+                };
+                let Some(parameters) = spec.get("parameters") else {
+                    return Err(CodexErr::Stream(format!(
+                        "Chat Completions tool `{name}` has no JSON schema"
+                    )));
+                };
+                let chat_name = match namespace.as_deref() {
+                    Some(namespace) => format!("{namespace}__{name}"),
+                    None => name.to_owned(),
+                };
+                if namespace.is_some() {
+                    tool_name_mappings.push(ChatToolNameMapping {
+                        chat_name: chat_name.clone(),
+                        namespace,
+                        name: name.to_owned(),
+                    });
+                }
+                tools.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": chat_name,
+                        "description": spec.get("description").and_then(serde_json::Value::as_str).unwrap_or_default(),
+                        "parameters": parameters,
+                    }
+                }));
+            }
+        }
+        if prompt.output_schema.is_some() {
+            return Err(CodexErr::Stream("Chat Completions does not support the Responses API structured output schema configured for this turn".into()));
+        }
+        let request = ChatCompletionsRequest {
+            model: model_info.slug.clone(),
+            messages,
+            tool_choice: (!tools.is_empty()).then(|| serde_json::json!("auto")),
+            parallel_tool_calls: Some(prompt.parallel_tool_calls),
+            tools: (!tools.is_empty()).then_some(tools),
+            stream: true,
+            stream_options: None,
+            tool_name_mappings,
+        };
+        let mut client_metadata = None;
+        let interceptors = crate::model_request::prepare(
+            &self.client.request_contributors,
+            &self.client.state.thread_id.to_string(),
+            &model_info.slug,
+            codex_extension_api::ModelRequestKind::Generation,
+            &mut client_metadata,
+        );
+        let inference_trace_attempt = inference_trace.start_attempt();
+        inference_trace_attempt.record_started(&request);
+        let request_auth_context = AuthRequestTelemetryContext::new(
+            client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+            client_setup.api_auth.as_ref(),
+            client_setup.agent_identity_telemetry.clone(),
+            PendingUnauthorizedRetry::default(),
+        )
+        .map_err(|error| self.client.state.provider.map_api_error(error))?;
+        let (request_telemetry, sse_telemetry) = ModelClientSession::build_streaming_telemetry(
+            session_telemetry,
+            request_auth_context,
+            RequestRouteTelemetry::for_endpoint("/chat/completions"),
+            self.client.state.auth_env_telemetry.clone(),
+        );
+        let transport = client_setup.build_api_transport("/chat/completions")?;
+        let client = ApiChatCompletionsClient::new(
+            transport,
+            client_setup.api_provider,
+            client_setup.api_auth,
+        )
+        .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+        match client.stream_request(request, ApiHeaderMap::new()).await {
+            Ok(stream) => {
+                let (stream, _) = map_response_stream(
+                    stream,
+                    session_telemetry.clone(),
+                    inference_trace_attempt,
+                    Arc::clone(&self.client.state.provider),
+                    interceptors,
+                );
+                Ok(stream)
+            }
+            Err(error) => {
+                let response_debug_context = extract_response_debug_context_from_api_error(&error);
+                let error = self.client.state.provider.map_api_error(error);
+                inference_trace_attempt.record_failed(
+                    &error,
+                    response_debug_context.request_id.as_deref(),
+                    /*output_items*/ &[],
+                );
+                Err(error)
             }
         }
     }

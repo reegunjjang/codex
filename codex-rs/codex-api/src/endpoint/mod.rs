@@ -1,3 +1,4 @@
+pub(crate) mod chat_completions;
 pub(crate) mod images;
 pub(crate) mod memories;
 pub(crate) mod models;
@@ -8,6 +9,10 @@ pub(crate) mod responses_websocket;
 pub(crate) mod search;
 mod session;
 
+pub use chat_completions::ChatCompletionsClient;
+pub use chat_completions::ChatCompletionsRequest;
+pub use chat_completions::ChatToolNameMapping;
+pub use chat_completions::chat_messages_from_response_items;
 pub use images::ImageRequestError;
 pub use images::ImagesClient;
 pub use memories::MemoriesClient;
