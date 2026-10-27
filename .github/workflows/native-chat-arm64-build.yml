@@ -1,27 +1,24 @@
-name: Native Chat Codex ARM64 package
+name: Native Chat Codex ARM64 build
 
 on:
-  push:
-    branches:
-      - codex/native-chat-completions-subagents
-    paths:
-      - "codex-rs/**"
-      - ".github/actions/**"
-      - ".github/scripts/**"
-      - ".github/workflows/native-chat-arm64-build.yml"
-      - "scripts/codex_package/**"
   workflow_dispatch:
+    inputs:
+      bwrap_sha256:
+        description: SHA-256 of the ARM64 bwrap bundled in the target installation
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Cross-build ARM64 Linux package
+    name: Cross-build Linux ARM64 CLI and helper
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
-      TARGET: aarch64-unknown-linux-musl
+      TARGET: aarch64-unknown-linux-gnu
+      CODEX_BWRAP_SHA256: ${{ inputs.bwrap_sha256 }}
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -59,50 +56,32 @@ jobs:
           cargo update --workspace
           echo "CODEX_VERSION=${version}" >> "$GITHUB_ENV"
 
-      - name: Install Linux build dependencies
+      - name: Install ARM64 GNU cross compiler
         run: |
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils llvm pkg-config libcap-dev
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: aarch64-unknown-linux-gnu
 
-      - name: Use hermetic Cargo home
-        shell: bash
-        run: |
-          cargo_home="${GITHUB_WORKSPACE}/.cargo-home"
-          mkdir -p "${cargo_home}/bin"
-          echo "CARGO_HOME=${cargo_home}" >> "$GITHUB_ENV"
-          echo "${cargo_home}/bin" >> "$GITHUB_PATH"
-          : > "${cargo_home}/config.toml"
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.14.0
-          use-cache: false
-
-      - name: Install musl cross-build tools
-        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
-        env:
-          TARGET: aarch64-unknown-linux-musl
-
-      - name: Configure Rusty V8 for ARM64
-        uses: ./.github/actions/setup-rusty-v8
-        with:
-          target: aarch64-unknown-linux-musl
-
-      - name: Build and hash bwrap
-        working-directory: codex-rs
+      - name: Configure cross-compilation tools
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --target "$TARGET" --release --bin bwrap
-          bwrap_path="${CARGO_TARGET_DIR}/${TARGET}/release/bwrap"
-          strip --strip-debug --strip-unneeded "$bwrap_path"
-          echo "CODEX_BWRAP_SHA256=$(sha256sum "$bwrap_path" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
+          [[ "$CODEX_BWRAP_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          {
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure Rusty V8 for ARM64 GNU
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: aarch64-unknown-linux-gnu
 
       - name: Build ARM64 Codex binaries
         working-directory: codex-rs
@@ -112,41 +91,28 @@ jobs:
           export STABLE_GIT_COMMIT="$(git rev-parse HEAD)"
           cargo build --target "$TARGET" --release --bin codex --bin codex-code-mode-host
 
-      - name: Assemble ARM64 Codex package
+      - name: Validate binary architecture and stage artifact
         shell: bash
         run: |
           set -euo pipefail
           release_dir="${CARGO_TARGET_DIR}/${TARGET}/release"
-          mkdir -p "${GITHUB_WORKSPACE}/dist/${TARGET}"
-          python3 scripts/build_codex_package.py \
-            --target "$TARGET" \
-            --variant codex \
-            --package-version "$CODEX_VERSION" \
-            --cargo-profile release \
-            --force \
-            --entrypoint-bin "${release_dir}/codex" \
-            --code-mode-host-bin "${release_dir}/codex-code-mode-host" \
-            --bwrap-bin "${release_dir}/bwrap" \
-            --strip-tool llvm-strip \
-            --package-dir "${RUNNER_TEMP}/codex-package-${TARGET}" \
-            --archive-output "${GITHUB_WORKSPACE}/dist/${TARGET}/codex-package-${TARGET}.tar.gz"
+          stage_dir="${RUNNER_TEMP}/codex-native-chat-arm64"
+          mkdir -p "$stage_dir"
+          cp "${release_dir}/codex" "${release_dir}/codex-code-mode-host" "$stage_dir/"
+          for binary in "$stage_dir/codex" "$stage_dir/codex-code-mode-host"; do
+            file "$binary"
+            readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+          done
+          printf 'version=%s\ntarget=%s\nsource=%s\nbwrap_sha256=%s\n' \
+            "$CODEX_VERSION" "$TARGET" "$GITHUB_SHA" "$CODEX_BWRAP_SHA256" \
+            > "$stage_dir/build-info.txt"
+          (cd "$stage_dir" && sha256sum codex codex-code-mode-host build-info.txt > SHA256SUMS)
 
-      - name: Validate ARM64 package contents
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="dist/${TARGET}/codex-package-${TARGET}.tar.gz"
-          tar -tzf "$archive" | sort
-          mkdir -p "${RUNNER_TEMP}/codex-package-check"
-          tar -xzf "$archive" -C "${RUNNER_TEMP}/codex-package-check"
-          file "${RUNNER_TEMP}/codex-package-check/bin/codex" \
-            "${RUNNER_TEMP}/codex-package-check/bin/codex-code-mode-host"
-
-      - name: Upload ARM64 package
+      - name: Upload ARM64 binaries
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-native-chat-arm64-${{ github.sha }}
-          path: dist/aarch64-unknown-linux-musl/codex-package-aarch64-unknown-linux-musl.tar.gz
+          path: ${{ runner.temp }}/codex-native-chat-arm64/*
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
