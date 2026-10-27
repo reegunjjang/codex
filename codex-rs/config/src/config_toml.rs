@@ -811,6 +811,10 @@ pub struct AgentRoleToml {
 
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+    /// Model used by agents created with this role.
+    pub model: Option<String>,
+    /// Provider ID used independently by agents created with this role.
+    pub model_provider: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
@@ -1036,6 +1040,17 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn agent_roles_accept_child_model_and_provider_overrides() {
+        let config: ConfigToml = toml::from_str(
+            "[agents.implementer]\ndescription = 'Implement tasks'\nmodel = 'deepseek-flash'\nmodel_provider = 'deepseek'\n",
+        )
+        .expect("agent role model/provider fields should parse");
+        let role = config.agents.expect("agents config").roles["implementer"].clone();
+        assert_eq!(role.model.as_deref(), Some("deepseek-flash"));
+        assert_eq!(role.model_provider.as_deref(), Some("deepseek"));
+    }
 
     #[test]
     fn sandbox_mode_uses_executor_platform_and_sandbox_level() {

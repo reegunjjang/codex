@@ -37,6 +37,7 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 struct AgentRoleOverrides {
     developer_instructions: Option<String>,
     model: Option<String>,
+    model_provider: Option<String>,
     model_reasoning_effort: Option<ReasoningEffort>,
     model_reasoning_summary: Option<ReasoningSummary>,
     model_verbosity: Option<Verbosity>,
@@ -72,14 +73,19 @@ async fn apply_role_to_config_inner(
     role: &AgentRoleConfig,
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
-    let Some(config_file) = role.config_file.as_ref() else {
-        return Ok(());
+    let role_config = if let Some(config_file) = role.config_file.as_ref() {
+        let role_layer_toml =
+            load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+        deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?
+    } else {
+        Default::default()
     };
-    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
-    let role_config = deserialize_config_toml_with_base(role_layer_toml, &config.codex_home)?;
     let mut overrides = AgentRoleOverrides {
         developer_instructions: role_config.developer_instructions,
-        model: role_config.model,
+        model: role_config.model.or_else(|| role.model.clone()),
+        model_provider: role_config
+            .model_provider
+            .or_else(|| role.model_provider.clone()),
         model_reasoning_effort: role_config.model_reasoning_effort,
         model_reasoning_summary: role_config.model_reasoning_summary,
         model_verbosity: role_config.model_verbosity,
@@ -183,6 +189,17 @@ mod role_overrides {
         next_config.config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
         if let Some(model) = &overrides.model {
             next_config.model = Some(model.clone());
+        }
+        if let Some(provider_id) = &overrides.model_provider {
+            let provider = config
+                .model_providers
+                .get(provider_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!("agent role selected unknown model provider `{provider_id}`")
+                })?;
+            next_config.model_provider_id = provider_id.clone();
+            next_config.model_provider = provider;
         }
         if let Some(instructions) = &overrides.developer_instructions {
             next_config.developer_instructions = Some(instructions.clone());
@@ -300,7 +317,7 @@ pub(crate) mod spawn_tool_spec {
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {
         if let Some(description) = &declaration.description {
-            let locked_settings_note = declaration
+            let role_toml = declaration
                 .config_file
                 .as_ref()
                 .and_then(|config_file| {
@@ -309,31 +326,42 @@ pub(crate) mod spawn_tool_spec {
                         .or_else(|| std::fs::read_to_string(config_file).ok())
                 })
                 .and_then(|contents| toml::from_str::<TomlValue>(&contents).ok())
-                .map(|role_toml| {
-                    let model = role_toml
-                        .get("model")
-                        .and_then(TomlValue::as_str);
-                    let reasoning_effort = role_toml
-                        .get("model_reasoning_effort")
-                        .and_then(TomlValue::as_str);
-                    match (model, reasoning_effort) {
-                        (Some(model), Some(reasoning_effort)) => format!(
-                            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
-                        ),
-                        (Some(model), None) => {
-                            format!(
-                                "\n- This role's model is set to `{model}` and cannot be changed."
-                            )
-                        }
-                        (None, Some(reasoning_effort)) => {
-                            format!(
-                                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
-                            )
-                        }
-                        (None, None) => String::new(),
-                    }
-                })
-                .unwrap_or_default();
+                .unwrap_or_else(|| TomlValue::Table(Default::default()));
+            let model = declaration
+                .model
+                .as_deref()
+                .or_else(|| role_toml.get("model").and_then(TomlValue::as_str));
+            let provider = declaration
+                .model_provider
+                .as_deref()
+                .or_else(|| role_toml.get("model_provider").and_then(TomlValue::as_str));
+            let reasoning_effort = role_toml
+                .get("model_reasoning_effort")
+                .and_then(TomlValue::as_str);
+            let locked_settings_note = match (model, provider, reasoning_effort) {
+                (Some(model), Some(provider), Some(effort)) => format!(
+                    "\n- This role is locked to model `{model}` from provider `{provider}` with reasoning effort `{effort}`."
+                ),
+                (Some(model), Some(provider), None) => format!(
+                    "\n- This role is locked to model `{model}` from provider `{provider}`."
+                ),
+                (Some(model), None, Some(effort)) => format!(
+                    "\n- This role's model is set to `{model}` and its reasoning effort is set to `{effort}`. These settings cannot be changed."
+                ),
+                (Some(model), None, None) => {
+                    format!("\n- This role's model is set to `{model}` and cannot be changed.")
+                }
+                (None, Some(provider), Some(effort)) => format!(
+                    "\n- This role is locked to provider `{provider}` with reasoning effort `{effort}`."
+                ),
+                (None, Some(provider), None) => {
+                    format!("\n- This role is locked to provider `{provider}`.")
+                }
+                (None, None, Some(effort)) => format!(
+                    "\n- This role's reasoning effort is set to `{effort}` and cannot be changed."
+                ),
+                (None, None, None) => String::new(),
+            };
             format!("{name}: {{\n{description}{locked_settings_note}\n}}")
         } else {
             format!("{name}: no description")
@@ -351,6 +379,8 @@ mod built_in {
                 (
                     DEFAULT_ROLE_NAME.to_string(),
                     AgentRoleConfig {
+                        model: None,
+                        model_provider: None,
                         description: Some("Default agent.".to_string()),
                         config_file: None,
                         nickname_candidates: None,
@@ -359,6 +389,8 @@ mod built_in {
                 (
                     "explorer".to_string(),
                     AgentRoleConfig {
+                        model: None,
+                        model_provider: None,
                         description: Some(r#"Use `explorer` for specific codebase questions.
 Explorers are fast and authoritative.
 They must be used to ask specific, well-scoped questions on the codebase.
@@ -373,6 +405,8 @@ Rules:
                 (
                     "worker".to_string(),
                     AgentRoleConfig {
+                        model: None,
+                        model_provider: None,
                         description: Some(r#"Use for execution and production work.
 Typical tasks:
 - Implement part of a feature

@@ -4855,6 +4855,8 @@ async fn spawn_thread_subagent_uses_role_specific_nickname_candidates() {
     harness.config.agent_roles.insert(
         "researcher".to_string(),
         AgentRoleConfig {
+            model: None,
+            model_provider: None,
             description: Some("Research role".to_string()),
             config_file: None,
             nickname_candidates: Some(vec!["Atlas".to_string()]),

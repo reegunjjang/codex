@@ -15,6 +15,10 @@ pub struct AgentRoleConfig {
     pub config_file: Option<PathBuf>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+    /// Optional model selected for this role's child agent.
+    pub model: Option<String>,
+    /// Optional provider selected for this role's child agent.
+    pub model_provider: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]

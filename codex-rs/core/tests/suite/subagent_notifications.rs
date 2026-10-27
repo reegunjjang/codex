@@ -3394,6 +3394,8 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
                 config.agent_roles.insert(
                     "custom".to_string(),
                     AgentRoleConfig {
+                        model: None,
+                        model_provider: None,
                         description: Some("Custom role".to_string()),
                         config_file: Some(role_path.to_path_buf()),
                         nickname_candidates: None,
@@ -3429,6 +3431,8 @@ async fn spawn_agent_preserves_configured_defaults_through_unrelated_role() -> R
                 config.agent_roles.insert(
                     "custom".to_string(),
                     AgentRoleConfig {
+                        model: None,
+                        model_provider: None,
                         description: Some("Custom role".to_string()),
                         config_file: Some(role_path.to_path_buf()),
                         nickname_candidates: None,
@@ -3497,6 +3501,8 @@ async fn spawn_agent_rejects_reasoning_effort_unsupported_by_role_model() -> Res
             config.agent_roles.insert(
                 "custom".to_string(),
                 AgentRoleConfig {
+                    model: None,
+                    model_provider: None,
                     description: Some("Custom role".to_string()),
                     config_file: Some(role_path.to_path_buf()),
                     nickname_candidates: None,
@@ -3569,6 +3575,8 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
         config.agent_roles.insert(
             "custom".to_string(),
             AgentRoleConfig {
+                model: None,
+                model_provider: None,
                 description: Some("Custom role".to_string()),
                 config_file: Some(role_path.to_path_buf()),
                 nickname_candidates: None,

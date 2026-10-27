@@ -158,6 +158,12 @@ async fn read_declared_role(
         role_name = parsed_file.role_name;
         role.description = parsed_file.description.or(role.description);
         role.nickname_candidates = parsed_file.nickname_candidates.or(role.nickname_candidates);
+        let role_file_config: ConfigToml = parsed_file
+            .config
+            .try_into()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        role.model = role_file_config.model.or(role.model);
+        role.model_provider = role_file_config.model_provider.or(role.model_provider);
     }
 
     Ok((role_name, role))
@@ -170,6 +176,11 @@ fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleCon
         .nickname_candidates
         .clone()
         .or(fallback.nickname_candidates.clone());
+    role.model = role.model.clone().or(fallback.model.clone());
+    role.model_provider = role
+        .model_provider
+        .clone()
+        .or(fallback.model_provider.clone());
 }
 
 fn agents_toml_from_layer(
@@ -213,6 +224,8 @@ async fn agent_role_config_from_toml(
         description,
         config_file: config_file.map(AbsolutePathBuf::into_path_buf),
         nickname_candidates,
+        model: role.model.clone(),
+        model_provider: role.model_provider.clone(),
     })
 }
 
@@ -327,6 +340,8 @@ async fn discover_agent_roles_in_dir(
                 description: parsed_file.description,
                 config_file: Some(agent_file.to_path_buf()),
                 nickname_candidates: parsed_file.nickname_candidates,
+                model: None,
+                model_provider: None,
             },
         );
     }
