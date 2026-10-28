@@ -5890,6 +5890,8 @@ enabled = false
         "custom".to_string(),
         crate::config::AgentRoleConfig {
             description: None,
+            model: None,
+            model_provider: None,
             config_file: Some(role_path.to_path_buf()),
             nickname_candidates: None,
         },
