@@ -9,6 +9,8 @@ use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
 use codex_client::RequestCompression;
 use codex_client::RequestTelemetry;
+use codex_client::Response;
+use codex_client::TransportError;
 use codex_http_client::ByteStream;
 use codex_http_client::RetryAfter;
 use codex_protocol::models::ContentItem;
@@ -18,6 +20,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TokenUsage;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
+use futures::stream;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::Method;
@@ -344,6 +347,164 @@ impl<T: HttpTransport> ChatCompletionsClient<T> {
             sse_telemetry,
         ))
     }
+
+    /// Sends a non-streaming Chat Completions request and adapts the response to Codex events.
+    pub async fn complete_request(
+        &self,
+        mut request: ChatCompletionsRequest,
+        extra_headers: HeaderMap,
+    ) -> Result<ResponseStream, ApiError> {
+        request.stream = false;
+        request.stream_options = None;
+        let body = serde_json::to_value(&request)
+            .map_err(|error| ApiError::Stream(format!("failed to encode chat request: {error}")))?;
+        let tool_name_mappings = request.tool_name_mappings.clone();
+        let response = self
+            .session
+            .execute_with(
+                Method::POST,
+                "/chat/completions",
+                extra_headers,
+                Some(body),
+                |req| {
+                    req.headers.insert(
+                        http::header::ACCEPT,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    req.compression = RequestCompression::None;
+                },
+            )
+            .await?;
+        let upstream_request_id = response
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if !response.status.is_success() {
+            return Err(chat_http_error(response));
+        }
+
+        let chunk = chat_response_to_stream_chunk(&response.body)?;
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let bytes: ByteStream = Box::pin(stream::iter([Ok::<_, TransportError>(
+            bytes::Bytes::from(sse),
+        )]));
+        Ok(spawn_chat_stream(
+            bytes,
+            upstream_request_id,
+            self.session.provider().stream_idle_timeout,
+            tool_name_mappings,
+            None,
+        ))
+    }
+}
+
+fn chat_http_error(response: Response) -> ApiError {
+    let retry_after = RetryAfter::from_headers(&response.headers);
+    let message = serde_json::from_slice::<Value>(&response.body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(&response.body).into_owned());
+    match response.status {
+        http::StatusCode::TOO_MANY_REQUESTS => ApiError::RateLimitExceeded {
+            message,
+            retry_after,
+        },
+        http::StatusCode::SERVICE_UNAVAILABLE => ApiError::ServerOverloaded { retry_after },
+        status => ApiError::Api { status, message },
+    }
+}
+
+fn chat_response_to_stream_chunk(body: &[u8]) -> Result<String, ApiError> {
+    let response: Value = serde_json::from_slice(body).map_err(|error| {
+        ApiError::Stream(format!("malformed Chat Completions response JSON: {error}"))
+    })?;
+    if let Some(error) = response.get("error") {
+        return Err(ApiError::Stream(format!(
+            "Chat Completions provider error: {error}"
+        )));
+    }
+    let choices = response
+        .get("choices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ApiError::Stream("malformed Chat Completions response: missing choices".into())
+        })?;
+    if choices.len() != 1 {
+        return Err(ApiError::Stream(format!(
+            "Chat Completions non-streaming response must contain exactly one choice, got {}",
+            choices.len()
+        )));
+    }
+    let choice = &choices[0];
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApiError::Stream(
+                "malformed Chat Completions response: missing assistant message".into(),
+            )
+        })?;
+    let mut delta = serde_json::Map::new();
+    if let Some(content) = message.get("content") {
+        delta.insert("content".into(), content.clone());
+    }
+    if let Some(calls) = message.get("tool_calls") {
+        let calls = calls.as_array().ok_or_else(|| {
+            ApiError::Stream(
+                "malformed Chat Completions response: tool_calls must be an array".into(),
+            )
+        })?;
+        let calls = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let mut call = call.clone();
+                if call.get("index").is_none() {
+                    call["index"] = serde_json::json!(index);
+                }
+                call
+            })
+            .collect::<Vec<_>>();
+        delta.insert("tool_calls".into(), Value::Array(calls));
+    } else if let Some(call) = message.get("function_call") {
+        let name = call.get("name").and_then(Value::as_str).ok_or_else(|| {
+            ApiError::Stream("malformed Chat Completions function_call: missing name".into())
+        })?;
+        let arguments = call
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApiError::Stream(
+                    "malformed Chat Completions function_call: missing arguments".into(),
+                )
+            })?;
+        delta.insert(
+            "tool_calls".into(),
+            serde_json::json!([{
+                "index": 0,
+                "id": format!("legacy-{}", response.get("id").and_then(Value::as_str).unwrap_or("call")),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments}
+            }]),
+        );
+    }
+    let chunk = serde_json::json!({
+        "id": response.get("id").cloned().unwrap_or(Value::String(String::new())),
+        "choices": [{
+            "index": choice.get("index").cloned().unwrap_or(serde_json::json!(0)),
+            "delta": delta,
+            "finish_reason": choice.get("finish_reason").cloned().unwrap_or(Value::Null),
+        }],
+        "usage": response.get("usage").cloned(),
+    });
+    serde_json::to_string(&chunk)
+        .map_err(|error| ApiError::Stream(format!("failed to adapt Chat response: {error}")))
 }
 
 fn spawn_chat_stream(

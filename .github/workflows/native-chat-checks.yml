@@ -1,0 +1,56 @@
+name: Native Chat focused checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/native-chat-completions-subagents
+    paths:
+      - "codex-rs/**"
+      - ".github/workflows/native-chat-checks.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Linux x64 format and focused tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+
+      - name: Format check
+        run: cargo fmt -- --config imports_granularity=Item --check
+
+      - name: Provider and Chat Completions tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/native-chat-test-reports"
+          cargo test -p codex-model-provider-info 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/provider.log"
+          cargo test -p codex-api --test chat_completions 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/chat-completions.log"
+          cargo test -p codex-core --lib agent::role_tests::apply_role_selects_its_own_chat_provider_and_model 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/agent-role.log"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: native-chat-linux-x64-test-reports-${{ github.sha }}
+          path: ${{ runner.temp }}/native-chat-test-reports/*.log
+          if-no-files-found: ignore
+          retention-days: 14

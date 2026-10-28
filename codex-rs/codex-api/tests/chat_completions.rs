@@ -36,8 +36,13 @@ struct FixtureTransport {
 }
 
 impl HttpTransport for FixtureTransport {
-    async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
-        Err(TransportError::Build("execute should not run".into()))
+    async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+        self.requests.lock().await.push(req);
+        Ok(Response {
+            status: self.status,
+            headers: HeaderMap::new(),
+            body: Bytes::from(self.body.clone()),
+        })
     }
 
     async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
@@ -50,6 +55,79 @@ impl HttpTransport for FixtureTransport {
             )])),
         })
     }
+}
+
+#[tokio::test]
+async fn chat_client_adapts_non_streaming_text_and_multiple_tool_calls() -> Result<()> {
+    let body = r#"{
+        "id":"chatcmpl-nonstream",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"working","tool_calls":[
+            {"id":"call-a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}},
+            {"id":"call-b","type":"function","function":{"name":"list_dir","arguments":"{}"}}
+        ]},"finish_reason":"tool_calls"}],
+        "usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}
+    }"#;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let client = ChatCompletionsClient::new(
+        FixtureTransport {
+            body: body.into(),
+            status: StatusCode::OK,
+            requests: requests.clone(),
+        },
+        provider(),
+        Arc::new(NoAuth),
+    );
+    let mut stream = client
+        .complete_request(
+            ChatCompletionsRequest {
+                model: "deepseek-chat".into(),
+                messages: vec![serde_json::json!({"role":"user","content":"inspect"})],
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: Some(true),
+                stream: false,
+                stream_options: None,
+                tool_name_mappings: Vec::new(),
+            },
+            HeaderMap::new(),
+        )
+        .await?;
+
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    let mut completed = None;
+    while let Some(event) = stream.next().await {
+        match event? {
+            ResponseEvent::OutputTextDelta(delta) => text.push_str(&delta),
+            ResponseEvent::OutputItemDone(item @ ResponseItem::FunctionCall { .. }) => {
+                calls.push(item)
+            }
+            ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                end_turn,
+                ..
+            } => completed = Some((response_id, token_usage, end_turn)),
+            _ => {}
+        }
+    }
+    assert_eq!(text, "working");
+    assert_eq!(calls.len(), 2);
+    assert!(matches!(&calls[0], ResponseItem::FunctionCall { call_id, .. } if call_id == "call-a"));
+    assert!(matches!(&calls[1], ResponseItem::FunctionCall { call_id, .. } if call_id == "call-b"));
+    let (response_id, usage, end_turn) = completed.expect("response should complete");
+    assert_eq!(response_id, "chatcmpl-nonstream");
+    assert_eq!(usage.expect("usage should be preserved").total_tokens, 8);
+    assert_eq!(end_turn, Some(false));
+
+    let requests = requests.lock().await;
+    assert!(requests[0].url.ends_with("/chat/completions"));
+    let Some(RequestBody::Json(body)) = requests[0].body.as_ref() else {
+        panic!("expected JSON request body");
+    };
+    assert_eq!(body["stream"], false);
+    assert!(body.get("stream_options").is_none());
+    Ok(())
 }
 
 #[derive(Clone, Default)]
