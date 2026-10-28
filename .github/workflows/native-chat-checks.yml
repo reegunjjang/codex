@@ -44,7 +44,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/native-chat-test-reports"
           cargo test -p codex-model-provider-info 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/provider.log"
           cargo test -p codex-api --test chat_completions 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/chat-completions.log"
-          cargo test -p codex-core --lib agent::role_tests::apply_role_selects_its_own_chat_provider_and_model 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/agent-role.log"
+          cargo test -p codex-core --lib agent::role::tests::apply_role_selects_its_own_chat_provider_and_model 2>&1 | tee "$RUNNER_TEMP/native-chat-test-reports/agent-role.log"
+          for report in "$RUNNER_TEMP"/native-chat-test-reports/*.log; do
+            if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' "$report"; then
+              echo "No passing tests were recorded in $report" >&2
+              exit 1
+            fi
+          done
 
       - name: Upload test reports
         if: always()
